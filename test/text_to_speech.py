@@ -1,4 +1,3 @@
-# text_to_speech.py
 import os
 import asyncio
 import requests  # type: ignore
@@ -17,9 +16,15 @@ class SpeechSynthesizer:
         self.elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
         self.response_queue = None
         self.is_running = True
-        self.voice_id = (
-            "21m00Tcm4TlvDq8ikWAM"  # We need to change the model after testing
-        )
+        self.voice_id = "21m00Tcm4TlvDq8ikWAM"  # Default voice ID
+        self.api_timing_stats = {
+            "total_calls": 0,
+            "total_time": 0,
+            "average_time": 0,
+            "max_time": 0,
+            "download_time": 0,
+            "playback_time": 0,
+        }
 
         if not self.elevenlabs_api_key:
             logger.error("ElevenLabs API key not found in environment variables")
@@ -44,6 +49,7 @@ class SpeechSynthesizer:
 
     async def _synthesize_speech(self, text):
         try:
+            start_time = time.time()
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}/stream"
 
             headers = {
@@ -57,10 +63,12 @@ class SpeechSynthesizer:
                 "model_id": "eleven_turbo_v2",
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
             }
+            
             with requests.post(
                 url, json=data, headers=headers, stream=True
             ) as response:
                 if response.status_code == 200:
+                    download_start = time.time()
                     with tempfile.NamedTemporaryFile(
                         delete=False, suffix=".mp3"
                     ) as temp_file:
@@ -68,13 +76,36 @@ class SpeechSynthesizer:
                             if chunk:
                                 temp_file.write(chunk)
                         temp_file_path = temp_file.name
+                    
+                    download_time = time.time() - download_start
+                    self.api_timing_stats["download_time"] += download_time
+                    
+                    audio_load_start = time.time()
                     audio = AudioSegment.from_mp3(temp_file_path)
-                    logger.info(f"Playing audio response")
+                    audio_load_time = time.time() - audio_load_start
+                    
+                    # Calculate API response time (not including playback)
+                    elapsed_time = time.time() - start_time
+                    self.api_timing_stats["total_calls"] += 1
+                    self.api_timing_stats["total_time"] += elapsed_time
+                    self.api_timing_stats["average_time"] = self.api_timing_stats["total_time"] / self.api_timing_stats["total_calls"]
+                    self.api_timing_stats["max_time"] = max(self.api_timing_stats["max_time"], elapsed_time)
+                    
+                    logger.info(f"ElevenLabs API timing: {elapsed_time:.2f}s (avg: {self.api_timing_stats['average_time']:.2f}s, max: {self.api_timing_stats['max_time']:.2f}s)")
+                    logger.info(f"Download time: {download_time:.2f}s, Audio load time: {audio_load_time:.2f}s")
+                    
+                    logger.info(f"Playing audio response (duration: {audio.duration_seconds:.2f}s)")
                     threading.Thread(target=play, args=(audio,)).start()
+                    
+                    # Add to playback time stats
+                    self.api_timing_stats["playback_time"] += audio.duration_seconds
 
                     def cleanup_temp_file():
                         time.sleep(audio.duration_seconds + 1)
-                        os.unlink(temp_file_path)
+                        try:
+                            os.unlink(temp_file_path)
+                        except Exception as e:
+                            logger.error(f"Error cleaning up temp file: {e}")
 
                     threading.Thread(target=cleanup_temp_file).start()
                 else:
@@ -89,6 +120,10 @@ class SpeechSynthesizer:
         self.voice_id = voice_id
         logger.info(f"Voice changed to {voice_id}")
 
+    def get_timing_stats(self):
+        return self.api_timing_stats
+
     def stop(self):
         self.is_running = False
         logger.info("Speech synthesizer stopped")
+        logger.info(f"Final ElevenLabs API timing stats: {self.api_timing_stats}")
